@@ -4213,6 +4213,11 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
     }
 }
 
+#[cfg(all(test, feature = "diagnostics"))]
+pub(crate) fn prepare_test_srv(list: &HostList, resource: This, words: [u32; 10]) {
+    readable(list, ResourceType::Srv, &View::Shader(resource as usize, Some(words)));
+}
+
 /// The pixel shaders whose draws get their slots listed
 /// ([`State::slots_text`]): `VICTORY_LIST_SLOTS`, hash prefixes separated
 /// by commas. None by default.

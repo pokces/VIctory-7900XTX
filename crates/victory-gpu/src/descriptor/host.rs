@@ -3888,6 +3888,15 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     make_twinned(view, at, None)
 }
 
+#[cfg(all(test, feature = "diagnostics"))]
+pub(crate) fn make_test_srv(
+    resource: crate::object::This,
+    words: [u32; 10],
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+) -> Option<ID3D12Resource> {
+    make(&View::Shader(resource as usize, Some(words)), at).flatten()
+}
+
 /// [`make`]; `twin`: where the raw twin of a buffer view goes
 /// ([`raw_twins`]; a constant buffer's is the same view again, other views
 /// have none).

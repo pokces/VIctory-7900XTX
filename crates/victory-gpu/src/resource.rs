@@ -3465,6 +3465,264 @@ mod tests {
     use super::*;
     use crate::object::slot;
 
+    #[cfg(all(windows, feature = "diagnostics"))]
+    fn write_packed_target(source: This, packed_light: u32) {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let host = crate::host::host().unwrap();
+        let written = host_resource(source).unwrap();
+        let (upload, data) = host.upload_buffer(1024).unwrap();
+        let seed = host.new_list().unwrap();
+        // SAFETY: four rows of four texels in the upload's 1024 mapped bytes.
+        unsafe {
+            for row in 0..4 {
+                for x in 0..4 {
+                    data.add(row * 256 + x * 4)
+                        .cast::<u32>()
+                        .write_unaligned(packed_light);
+                }
+            }
+            let dst = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(written),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    SubresourceIndex: 0,
+                },
+            };
+            let src = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&upload),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: written.GetDesc().Format,
+                            Width: 4,
+                            Height: 4,
+                            Depth: 1,
+                            RowPitch: 256,
+                        },
+                    },
+                },
+            };
+            crate::list::ensure_state(&seed, source, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
+            seed.list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+        }
+        seed.close();
+        host.execute(&[&seed]);
+    }
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    fn packed_alias_read_probe_pipeline() -> (
+        windows::Win32::Graphics::Direct3D12::ID3D12RootSignature,
+        windows::Win32::Graphics::Direct3D12::ID3D12PipelineState,
+    ) {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let host = crate::host::host().unwrap();
+        let source = r#"
+#define RS "DescriptorTable(SRV(t0)), UAV(u0)"
+Texture2D<float4> t : register(t0);
+RWByteAddressBuffer o : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() { o.Store4(0, asuint(t.Load(int3(0, 0, 0)))); }
+"#;
+        let bytes = crate::host::compile(
+            source,
+            windows::core::s!("main"),
+            windows::core::s!("cs_5_1"),
+        )
+        .unwrap();
+        // SAFETY: the compiled shader embeds its root signature.
+        unsafe {
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &bytes).unwrap();
+            let pso = host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: bytes.as_ptr().cast(),
+                        BytecodeLength: bytes.len(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            (root, pso)
+        }
+    }
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    fn unpack_rgb9e5(packed: u32) -> [f32; 3] {
+        let scale = 2f32.powi((packed >> 27) as i32 - 15 - 9);
+        [packed & 511, (packed >> 9) & 511, (packed >> 18) & 511].map(|m| m as f32 * scale)
+    }
+
+    /// A published SRV must see the active writer even after the table that
+    /// contains it has been copied to a shader-visible heap.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn a_published_packed_view_survives_writer_replacement_and_cpu_upload() {
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows::Win32::Graphics::Direct3D12::*;
+
+        let requested = std::env::var_os("VICTORY_ALIAS_CAST").is_some_and(|v| v == "1");
+        let Some(host) = crate::host::host() else {
+            assert!(!requested, "requested cast test requires a D3D12 host");
+            return;
+        };
+        if requested {
+            assert!(cast_on(), "requested cast test requires relaxed casting and ID3D12Device10");
+        }
+        use windows::Win32::Graphics::Dxgi::*;
+        // SAFETY: query the adapter of the D3D12 device that will run the dispatch.
+        let desc = unsafe {
+            CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(host.device.GetAdapterLuid()))
+                .and_then(|a| a.GetDesc1())
+        }
+        .unwrap();
+        let name = String::from_utf16_lossy(&desc.Description);
+        eprintln!("D3D12 adapter {}, relaxed cast {}", name.trim_end_matches('\0'), cast_on());
+        let null = std::ptr::null();
+        let target_desc = ResourceDesc {
+            flags: 4,
+            ..texture(4, 4, CAST_WRITTEN, 1)
+        };
+        let view_desc = texture(4, 4, CAST_READ, 1);
+        let (mut first, mut second, mut view) = (null, null, null);
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &target_desc,
+                0,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut first
+            ),
+            S_OK
+        );
+        let address = resource(first).data() as u64;
+        assert_eq!(
+            create_at_address(
+                null,
+                address,
+                &view_desc,
+                0,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut view
+            ),
+            S_OK
+        );
+        // Match texture_at's placed view without keeping this test allocation
+        // in the process-wide cache after the test.
+        resource(view).host.placed.store(true, Relaxed);
+        let ty = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        let words = [
+            CAST_READ,
+            D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32,
+            D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            0,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+        ];
+        // The GPU-visible table takes one copy now. No later writer change
+        // updates it. Sampling it after each write tests the old descriptor.
+        let (cpu, gpu, start) = unsafe {
+            let desc = D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: ty,
+                NumDescriptors: 1,
+                ..Default::default()
+            };
+            let cpu: ID3D12DescriptorHeap = host.device.CreateDescriptorHeap(&desc).unwrap();
+            let gpu: ID3D12DescriptorHeap = host
+                .device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    ..desc
+                })
+                .unwrap();
+            let start = cpu.GetCPUDescriptorHandleForHeapStart();
+            (cpu, gpu, start)
+        };
+        let _descriptor_resource = crate::descriptor::host::make_test_srv(view, words, start).unwrap();
+        // SAFETY: one descriptor in two live heaps of the same type.
+        unsafe {
+            host.device.CopyDescriptorsSimple(
+                1,
+                gpu.GetCPUDescriptorHandleForHeapStart(),
+                start,
+                ty,
+            )
+        };
+        let (root, pso) = packed_alias_read_probe_pipeline();
+        let (out, data) = host.shared_buffer(16).unwrap();
+        let sample = || {
+            let list = host.new_list().unwrap();
+            crate::draw::prepare_test_srv(&list, view, words);
+            // SAFETY: the shader writes a single float4 into the live output buffer.
+            unsafe {
+                list.list.SetDescriptorHeaps(&[Some(gpu.clone())]);
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetPipelineState(&pso);
+                list.list
+                    .SetComputeRootDescriptorTable(0, gpu.GetGPUDescriptorHandleForHeapStart());
+                list.list
+                    .SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
+                list.list.Dispatch(1, 1, 1);
+            }
+            list.close();
+            host.execute(&[&list]);
+            // SAFETY: execute waited for the GPU and the output stays mapped.
+            unsafe { data.cast::<[f32; 3]>().read_unaligned() }
+        };
+        write_packed_target(first, 0x8c02_0100);
+        assert_eq!(alias_of(view), Some(first));
+        let first_rgb = sample();
+        assert_eq!(
+            create_at_address(
+                null,
+                address,
+                &target_desc,
+                0,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut second
+            ),
+            S_OK
+        );
+        write_packed_target(second, 0x9730_3211);
+        assert_eq!(alias_of(view), Some(second));
+        let second_rgb = sample();
+        resource_release(second);
+        assert_eq!(alias_of(view), None);
+
+        let count = footprint(&view_desc).unwrap().size as usize;
+        assert!(count <= footprint(&target_desc).unwrap().size as usize);
+        crate::watch::writing(address as usize, count);
+        // SAFETY: first still owns the entire allocation backing the placed view.
+        let memory = unsafe { std::slice::from_raw_parts_mut(address as *mut u32, count / 4) };
+        let cpu_word = 0x8b22_3301;
+        memory.fill(cpu_word);
+        let cpu_rgb = sample();
+        drop(cpu);
+        resource_release(view);
+        resource_release(first);
+
+        for (stage, rgb, word) in [
+            ("GPU writer A", first_rgb, 0x8c02_0100),
+            ("replacement GPU writer B", second_rgb, 0x9730_3211),
+            ("subsequent CPU upload", cpu_rgb, cpu_word),
+        ] {
+            assert_eq!(rgb, unpack_rgb9e5(word), "stale copied SRV after {stage}");
+        }
+    }
+
     #[test]
     fn a8_unorm_is_not_in_the_r8_typeless_family() {
         // DXGI_FORMAT values: 60 R8_TYPELESS, 61 R8_UNORM, 62 R8_UINT,
